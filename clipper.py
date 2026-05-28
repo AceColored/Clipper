@@ -1,24 +1,15 @@
-#!/usr/bin/env python3
-"""
-Clipper — always-on rolling buffer recorder
-Just run it. Dependencies install automatically on first launch.
-Run as Administrator for global hotkeys to work in games.
-"""
-
 import os, sys, time, wave, threading, subprocess, collections, json, importlib.util
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog
 
-# hide console window immediately if one exists
 try:
     import ctypes
     ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
 except Exception:
     pass
 
-# ── auto-install dependencies on first run ────────────────────────────────────
 def _bootstrap():
     needed = [
         ('keyboard',      'keyboard'),
@@ -31,7 +22,6 @@ def _bootstrap():
     missing = [pkg for mod, pkg in needed if importlib.util.find_spec(mod) is None]
     if not missing:
         return
-
     splash = tk.Tk()
     splash.overrideredirect(True)
     splash.configure(bg='#0d0d0d')
@@ -42,11 +32,9 @@ def _bootstrap():
     tk.Label(splash, text='Installing packages, one moment…', bg='#0d0d0d', fg='#565659',
              font=('Segoe UI', 9)).pack()
     splash.update()
-
     subprocess.check_call(
         [sys.executable, '-m', 'pip', 'install', '--quiet'] + missing,
         creationflags=subprocess.CREATE_NO_WINDOW)
-
     splash.destroy()
 
 _bootstrap()
@@ -55,7 +43,6 @@ import numpy as np
 import keyboard, mss, cv2, sounddevice as sd
 import imageio_ffmpeg
 
-# ── constants ─────────────────────────────────────────────────────────────────
 SAMPLE_RATE  = 44100
 CHANNELS     = 2
 JPEG_QUALITY = 78
@@ -66,8 +53,6 @@ DURATIONS    = {'5 sec': 5, '10 sec': 10, '15 sec': 15, '30 sec': 30, '1 min': 6
 DEFAULTS     = {'monitor': 0, 'resolution': '1080p', 'fps': 30, 'audio_name': None,
                 'duration': '30 sec', 'hotkey': 'ctrl+c',
                 'output_dir': str(Path.home() / 'clips')}
-
-# ── config ────────────────────────────────────────────────────────────────────
 
 def _load_cfg():
     cfg = dict(DEFAULTS)
@@ -81,21 +66,17 @@ def _save_cfg(cfg):
     try: CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
     except Exception: pass
 
-# ── rolling buffer ────────────────────────────────────────────────────────────
 _vbuf    = collections.deque()
 _abuf    = collections.deque()
 _lock    = threading.Lock()
 _stop_ev = threading.Event()
 _saving  = False
 
-# ── helpers ───────────────────────────────────────────────────────────────────
-
 def _get_monitors():
     with mss.mss() as sct:
         return sct.monitors[1:]
 
 def _edid_name(edid: bytes) -> str:
-    """Extract monitor model name from EDID descriptor block 0xFC."""
     for i in range(4):
         o = 54 + i * 18
         if len(edid) < o + 18:
@@ -104,9 +85,7 @@ def _edid_name(edid: bytes) -> str:
             return edid[o+5:o+18].decode('cp437', errors='ignore').rstrip('\n').rstrip()
     return ''
 
-
 def _get_monitor_names():
-    """Return monitor model names (from EDID) in active display order."""
     try:
         import ctypes, winreg, re
         from ctypes import wintypes, Structure, c_wchar
@@ -124,9 +103,7 @@ def _get_monitor_names():
                 break
             if adp.StateFlags & 1:
                 mon = DD(); mon.cb = ctypes.sizeof(DD)
-                ctypes.windll.user32.EnumDisplayDevicesW(
-                    adp.DeviceName, 0, ctypes.byref(mon), 1)  # EDD_GET_DEVICE_INTERFACE_NAME
-
+                ctypes.windll.user32.EnumDisplayDevicesW(adp.DeviceName, 0, ctypes.byref(mon), 1)
                 name = ''
                 m = re.search(r'DISPLAY#([^#]+)#', mon.DeviceID or '')
                 if m:
@@ -146,7 +123,6 @@ def _get_monitor_names():
                                 k += 1
                     except Exception:
                         pass
-
                 names.append(name or f'Display {len(names)+1}')
             i += 1
         return names
@@ -176,8 +152,6 @@ def _scaled_size(monitor, res_label):
     scale = th / nh
     return int(nw * scale) & ~1, int(nh * scale) & ~1
 
-# ── audio callback ────────────────────────────────────────────────────────────
-
 def _audio_cb(indata, frames, t, status):
     if not _stop_ev.is_set():
         now = time.time()
@@ -186,8 +160,6 @@ def _audio_cb(indata, frames, t, status):
             cutoff = now - MAX_BUF_SECS
             while _abuf and _abuf[0][0] < cutoff:
                 _abuf.popleft()
-
-# ── screen capture ────────────────────────────────────────────────────────────
 
 def _capture_loop(monitor, w, h, fps, stop_ev):
     interval = 1.0 / fps
@@ -210,8 +182,6 @@ def _capture_loop(monitor, w, h, fps, stop_ev):
             wait = nxt - time.perf_counter()
             if wait > 0:
                 time.sleep(wait)
-
-# ── saver ─────────────────────────────────────────────────────────────────────
 
 def _save(dur_secs, fps, w, h, out_dir, ffmpeg, on_done):
     global _saving
@@ -270,7 +240,6 @@ def _save(dur_secs, fps, w, h, out_dir, ffmpeg, on_done):
     else:
         on_done(False, result.stderr.decode(errors='replace'))
 
-# ── design tokens ────────────────────────────────────────────────────────────
 BG      = '#0d0d0d'
 CARD    = '#131315'
 CARD_B  = '#1b1b1e'
@@ -283,7 +252,6 @@ FONT    = 'Segoe UI'
 
 
 class _Bar(tk.Canvas):
-    """Slim rounded progress bar."""
     def __init__(self, parent, h=6, **kw):
         super().__init__(parent, height=h, bg=CARD, highlightthickness=0, **kw)
         self._v = 0; self._m = 1
@@ -317,20 +285,16 @@ def _card(parent, padx=14, pady=12):
     inner.pack(fill='both', expand=True, padx=padx, pady=pady)
     return inner
 
-
 def _label(parent, text):
     return tk.Label(parent, text=text, bg=CARD, fg=TEXT2, font=(FONT, 9))
 
-
 def _btn(parent, text, cmd, state='normal'):
-    b = tk.Button(parent, text=text, command=cmd, state=state,
-                  bg=CARD_B, fg=TEXT, activebackground=BORDER2,
-                  activeforeground=TEXT, disabledforeground=TEXT2,
-                  relief='flat', bd=0, padx=12, pady=6, font=(FONT, 9),
-                  highlightthickness=1, highlightbackground=BORDER2,
-                  cursor='hand2')
-    return b
-
+    return tk.Button(parent, text=text, command=cmd, state=state,
+                     bg=CARD_B, fg=TEXT, activebackground=BORDER2,
+                     activeforeground=TEXT, disabledforeground=TEXT2,
+                     relief='flat', bd=0, padx=12, pady=6, font=(FONT, 9),
+                     highlightthickness=1, highlightbackground=BORDER2,
+                     cursor='hand2')
 
 def _radio_row(parent, var, options):
     f = tk.Frame(parent, bg=CARD)
@@ -342,7 +306,6 @@ def _radio_row(parent, var, options):
                        cursor='hand2').pack(side='left', padx=(0, 12))
     return f
 
-
 def _entry(parent, var, width=20):
     return tk.Entry(parent, textvariable=var, width=width,
                     bg=CARD_B, fg=TEXT, font=(FONT, 9),
@@ -351,13 +314,11 @@ def _entry(parent, var, width=20):
                     highlightcolor=ACCENT)
 
 
-# ── GUI ───────────────────────────────────────────────────────────────────────
-
 class App(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.overrideredirect(True)   # remove default title bar
+        self.overrideredirect(True)
         self.resizable(False, False)
         self.configure(bg=BG)
         self._dx = self._dy = 0
@@ -379,8 +340,6 @@ class App(tk.Tk):
         self.after(20,  self._fix_win)
         self.after(150, self._start)
 
-    # ── ttk theme ──────────────────────────────────────────────────────────
-
     def _style_ttk(self):
         s = ttk.Style(self)
         s.theme_use('clam')
@@ -400,17 +359,12 @@ class App(tk.Tk):
         self.option_add('*TCombobox*Listbox.font', (FONT, 9))
         self.option_add('*TCombobox*Listbox.relief', 'flat')
 
-    # ── DWM: dark title bar + rounded corners (Windows 11) ────────────────
-
     def _fix_win(self):
-        """Apply rounded corners + keep window in taskbar despite overrideredirect."""
         try:
             import ctypes
-            hwnd = ctypes.windll.user32.GetAncestor(self.winfo_id(), 2)  # GA_ROOT
-            # Rounded corners (Windows 11)
+            hwnd = ctypes.windll.user32.GetAncestor(self.winfo_id(), 2)
             ctypes.windll.dwmapi.DwmSetWindowAttribute(
                 hwnd, 33, ctypes.byref(ctypes.c_int(2)), 4)
-            # WS_EX_APPWINDOW so it shows in taskbar
             GWL_EXSTYLE = -20
             cur = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
             ctypes.windll.user32.SetWindowLongW(
@@ -424,10 +378,8 @@ class App(tk.Tk):
         tb = tk.Frame(self, bg=BG, height=32)
         tb.pack(fill='x')
         tb.pack_propagate(False)
-
         tk.Label(tb, text='● Clipper', bg=BG, fg=TEXT2,
                  font=(FONT, 9)).pack(side='left', padx=12)
-
         for sym, cmd, hbg, hfg in [
             ('✕', self._quit,     '#c0392b', '#ffffff'),
             ('⎯', self._minimize, '#1e1e21', TEXT),
@@ -438,10 +390,7 @@ class App(tk.Tk):
             lbl.bind('<Button-1>', lambda e, c=cmd: c())
             lbl.bind('<Enter>',   lambda e, l=lbl, b=hbg, f=hfg: l.config(bg=b, fg=f))
             lbl.bind('<Leave>',   lambda e, l=lbl: l.config(bg=BG, fg=TEXT2))
-
         tk.Frame(self, bg=BORDER, height=1).pack(fill='x')
-
-        # drag
         tb.bind('<ButtonPress-1>',
                 lambda e: (setattr(self, '_dx', e.x_root - self.winfo_x()),
                            setattr(self, '_dy', e.y_root - self.winfo_y())))
@@ -452,44 +401,32 @@ class App(tk.Tk):
         try:
             import ctypes
             hwnd = ctypes.windll.user32.GetAncestor(self.winfo_id(), 2)
-            ctypes.windll.user32.ShowWindow(hwnd, 6)  # SW_MINIMIZE
+            ctypes.windll.user32.ShowWindow(hwnd, 6)
         except Exception:
             self.iconify()
-
-    # ── build ──────────────────────────────────────────────────────────────
 
     def _build(self):
         self._build_titlebar()
         tk.Frame(self, bg=BG, height=4).pack()
 
-        # ── status card ──────────────────────────────────────────────────
         sc = _card(self, pady=10)
-
         row = tk.Frame(sc, bg=CARD)
         row.pack(fill='x')
-
         self._dot_cv = tk.Canvas(row, width=10, height=10, bg=CARD, highlightthickness=0)
         self._dot_cv.pack(side='left', padx=(0, 7))
         self._dot_id = self._dot_cv.create_oval(1, 1, 9, 9, fill=ACCENT, outline='')
-
-        tk.Label(row, text='REC', bg=CARD, fg=TEXT,
-                 font=(FONT, 9, 'bold')).pack(side='left')
-
+        tk.Label(row, text='REC', bg=CARD, fg=TEXT, font=(FONT, 9, 'bold')).pack(side='left')
         self._buf_var = tk.StringVar(value='')
-        tk.Label(row, textvariable=self._buf_var, bg=CARD, fg=TEXT2,
-                 font=(FONT, 9)).pack(side='right')
-
+        tk.Label(row, textvariable=self._buf_var, bg=CARD, fg=TEXT2, font=(FONT, 9)).pack(side='right')
         self._bar = _Bar(sc, h=5)
         self._bar.pack(fill='x', pady=(8, 0))
 
-        # ── settings card ────────────────────────────────────────────────
         stc = _card(self)
         G = {'sticky': 'w', 'padx': (0, 10), 'pady': 4}
 
-        # monitor
         _label(stc, 'Monitor').grid(row=0, column=0, **G)
-        friendly   = _get_monitor_names()
-        mon_names  = [
+        friendly  = _get_monitor_names()
+        mon_names = [
             f"{friendly[i]}  ({m['width']}×{m['height']})"
             if i < len(friendly) and friendly[i]
             else f"Monitor {i+1}  ({m['width']}×{m['height']})"
@@ -501,19 +438,16 @@ class App(tk.Tk):
         self._mon_cb.grid(row=0, column=1, columnspan=2, sticky='ew', pady=4)
         self._mon_cb.current(min(self._cfg['monitor'], len(mon_names)-1))
 
-        # resolution
         _label(stc, 'Resolution').grid(row=1, column=0, **G)
         self._res_var = tk.StringVar(value=self._cfg['resolution'])
         _radio_row(stc, self._res_var, ('360p', '720p', '1080p')).grid(
             row=1, column=1, columnspan=2, sticky='w', pady=4)
 
-        # fps
         _label(stc, 'FPS').grid(row=2, column=0, **G)
         self._fps_var = tk.StringVar(value=str(self._cfg['fps']))
         _radio_row(stc, self._fps_var, ('15', '30', '60')).grid(
             row=2, column=1, columnspan=2, sticky='w', pady=4)
 
-        # audio
         _label(stc, 'Audio').grid(row=3, column=0, **G)
         AUTO = 'Auto — All PC Sounds  (recommended)'
         self._auto_label = AUTO
@@ -525,52 +459,41 @@ class App(tk.Tk):
         saved = self._cfg.get('audio_name')
         self._aud_cb.current(dev_names.index(saved) if saved and saved in dev_names else 0)
 
-        # clip length
         _label(stc, 'Clip Length').grid(row=4, column=0, **G)
         self._dur_var = tk.StringVar(value=self._cfg['duration'])
         _radio_row(stc, self._dur_var, list(DURATIONS.keys())).grid(
             row=4, column=1, columnspan=2, sticky='w', pady=4)
 
-        # hotkey
         _label(stc, 'Hotkey').grid(row=5, column=0, **G)
         self._hk_var = tk.StringVar(value=self._cfg['hotkey'])
         _entry(stc, self._hk_var, width=18).grid(row=5, column=1, sticky='w', pady=4)
 
-        # save to
         _label(stc, 'Save To').grid(row=6, column=0, **G)
         self._dir_var = tk.StringVar(value=self._cfg['output_dir'])
         _entry(stc, self._dir_var, width=22).grid(row=6, column=1, sticky='ew', pady=4)
         _btn(stc, 'Browse…', self._browse).grid(row=6, column=2, padx=(6, 0), pady=4)
 
-        # divider
         tk.Frame(stc, bg=BORDER, height=1).grid(
             row=7, column=0, columnspan=3, sticky='ew', pady=(8, 6))
 
-        # always on top + apply row
         bot = tk.Frame(stc, bg=CARD)
         bot.grid(row=8, column=0, columnspan=3, sticky='ew')
-
         self._topmost_var = tk.BooleanVar(value=self._cfg.get('topmost', False))
         tk.Checkbutton(bot, text='Always on top', variable=self._topmost_var,
                        bg=CARD, fg=TEXT, selectcolor=CARD_B,
                        activebackground=CARD, activeforeground=TEXT,
                        font=(FONT, 9), bd=0, highlightthickness=0,
                        cursor='hand2', command=self._toggle_topmost).pack(side='left')
-
         _btn(bot, 'Apply Settings', self._apply).pack(side='right')
 
         stc.columnconfigure(1, weight=1)
 
-        # ── actions card ─────────────────────────────────────────────────
         ac = _card(self, pady=10)
-
         brow = tk.Frame(ac, bg=CARD)
         brow.pack(fill='x')
-
         self._prev_btn = _btn(brow, '▶  Preview Last Clip', self._preview, state='disabled')
         self._prev_btn.pack(side='left', padx=(0, 8))
         _btn(brow, '📂  Open Clips Folder', self._open_folder).pack(side='left')
-
         self._sv = tk.StringVar(value='Starting…')
         tk.Label(ac, textvariable=self._sv, bg=CARD, fg=TEXT2,
                  font=(FONT, 8)).pack(anchor='w', pady=(7, 0))
@@ -582,19 +505,13 @@ class App(tk.Tk):
 
         self._pulse()
 
-    # ── pulsing REC dot ────────────────────────────────────────────────────
-
     def _pulse(self):
         self._pb = not self._pb
         self._dot_cv.itemconfig(self._dot_id, fill=ACCENT if self._pb else '#5c1a14')
         self.after(750, self._pulse)
 
-    # ── always on top ──────────────────────────────────────────────────────
-
     def _toggle_topmost(self):
         self.wm_attributes('-topmost', self._topmost_var.get())
-
-    # ── capture ────────────────────────────────────────────────────────────
 
     def _start(self):
         global _stop_ev, _vbuf, _abuf
