@@ -1,4 +1,3 @@
-# screen + desktop audio clipper — saves the last N seconds on a hotkey
 # deps auto-install on first run; config at ~/.clipper.json
 # tested on Win10/11, python 3.10+
 
