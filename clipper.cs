@@ -1179,7 +1179,7 @@ static class ClipEncoder
 
         var args = new List<string> {
             "-y", "-f", "image2pipe",
-            "-framerate", realFps.ToString("F4"),
+            "-framerate", realFps.ToString("F4", System.Globalization.CultureInfo.InvariantCulture),
             "-i", "pipe:0"
         };
         if (withAudio) { args.Add("-i"); args.Add($"\"{wavTmp}\""); }
