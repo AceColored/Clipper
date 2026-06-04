@@ -45,7 +45,7 @@ static class Program
 
 public class AtlasConfig
 {
-    // defaults that made sense after testing on a few machines
+
     [JsonPropertyName("monitor")]    public int     MonitorIdx  { get; set; } = 0;
     [JsonPropertyName("resolution")] public string  Res         { get; set; } = "1080p";
     [JsonPropertyName("fps")]        public int     Fps         { get; set; } = 30;
@@ -66,7 +66,7 @@ public class AtlasConfig
             return JsonSerializer.Deserialize<AtlasConfig>(File.ReadAllText(SettingsPath)) ?? new();
         }
         catch (JsonException) {
-            // corrupted — nuke it and start clean rather than crashing on every launch
+
             try { File.Delete(SettingsPath); } catch { }
             return new();
         }
@@ -78,12 +78,11 @@ public class AtlasConfig
             File.WriteAllText(SettingsPath,
                 JsonSerializer.Serialize(this, new JsonSerializerOptions { WriteIndented = true }));
         } catch (UnauthorizedAccessException) {
-            // sandboxed or read-only profile, nothing we can do
+
         }
     }
 }
 
-// generic sliding window — oldest entries drop off automatically
 public class RingBuffer<T>
 {
     readonly LinkedList<(double when, T payload)> items = new();
@@ -119,14 +118,12 @@ static class FfmpegFinder
 
     public static string? Locate()
     {
-        // next to exe wins (dev mode / user-supplied version)
+
         var next2exe = Path.Combine(AppContext.BaseDirectory, "ffmpeg.exe");
         if (File.Exists(next2exe)) return next2exe;
 
-        // cached extraction from last run
         if (File.Exists(CachePath)) return CachePath;
 
-        // extract embedded resource to local app data cache
         var stream = System.Reflection.Assembly.GetExecutingAssembly()
             .GetManifestResourceStream("Atlas.ffmpeg.exe");
         if (stream != null)
@@ -141,7 +138,6 @@ static class FfmpegFinder
             catch { }
         }
 
-        // fallback: PATH and common install spots
         foreach (var dir in (Environment.GetEnvironmentVariable("PATH") ?? "").Split(';'))
         {
             var p = Path.Combine(dir.Trim(), "ffmpeg.exe");
@@ -185,7 +181,7 @@ static class DisplayHelper
                 dd = new DISPLAY_DEVICE { cb = Marshal.SizeOf<DISPLAY_DEVICE>() };
             }
         }
-        catch { /* EDID read failed — we'll fall back to "Display N" labels */ }
+        catch {  }
         return result;
     }
 
@@ -205,8 +201,6 @@ static class DisplayHelper
                 using var pk = key.OpenSubKey($@"{sub}\Device Parameters");
                 if (pk?.GetValue("EDID") is not byte[] edid) continue;
 
-                // EDID spec: descriptor blocks start at offset 54, each 18 bytes
-                // type byte 0xFC = monitor name string
                 for (int j = 0; j < 4; j++)
                 {
                     int o = 54 + j * 18;
@@ -235,7 +229,6 @@ static class DisplayHelper
     static extern bool EnumDisplayDevices(string? lpDevice, uint iDevNum, ref DISPLAY_DEVICE lpDD, uint dwFlags);
 }
 
-// thin progress bar drawn manually so we can match the dark theme exactly
 public class ThinBar : Control
 {
     double cur, cap = 1;
@@ -273,7 +266,7 @@ public class RoundButton : Control
     static readonly Color hoverEdge  = Color.FromArgb(0x78, 0x78, 0x78);
     static readonly Color normalText = Color.FromArgb(0xEE, 0xEE, 0xEE);
     static readonly Color dimText    = Color.FromArgb(0x48, 0x48, 0x48);
-    // subtle top gradient to break the flat look
+
     static readonly Color topGlow   = Color.FromArgb(0x48, 0xFF, 0xFF, 0xFF);
     const int rad = 7;
 
@@ -344,7 +337,6 @@ public class RoundButton : Control
     }
 }
 
-// wraps a borderless TextBox in a panel we can draw our own border on
 public class StyledTextBox : Control
 {
     readonly TextBox inner;
@@ -393,7 +385,6 @@ public class StyledTextBox : Control
     }
 }
 
-// click it, press your combo, done — no typing
 public class HotkeyCapture : Control
 {
     bool listening;
@@ -435,7 +426,6 @@ public class HotkeyCapture : Control
         if (!listening) { base.OnKeyDown(e); return; }
         e.SuppressKeyPress = true;
 
-        // ignore bare modifier presses — wait for an actual key
         if (e.KeyCode is Keys.ControlKey or Keys.LControlKey or Keys.RControlKey
             or Keys.ShiftKey or Keys.LShiftKey or Keys.RShiftKey
             or Keys.Menu or Keys.LMenu or Keys.RMenu
@@ -609,7 +599,6 @@ public class DropPicker : Control
         g.DrawString(SelectedItem?.ToString() ?? "", Font, new SolidBrush(itemFg),
             new RectangleF(9, 0, Width - 26, Height), sf);
 
-        // chevron flips when open
         int cx = Width - 13, cy = Height / 2;
         PointF[] tri = open
             ? [new(cx - 3.5f, cy + 1.5f), new(cx + 3.5f, cy + 1.5f), new(cx, cy - 2.5f)]
@@ -618,7 +607,6 @@ public class DropPicker : Control
     }
 }
 
-// the actual dropdown list that pops up
 internal class FlyoutList : Form
 {
     static readonly Color bg      = Color.FromArgb(0x1E, 0x1E, 0x1E);
@@ -655,14 +643,12 @@ internal class FlyoutList : Form
         ShowInTaskbar   = false;
         Size = new Size(width, totalH);
 
-        // if the popup would go off the bottom of the screen, show it above instead
         var workArea = Screen.FromPoint(screenPos).WorkingArea;
         int y = screenPos.Y + totalH > workArea.Bottom
             ? screenPos.Y - totalH - 26
             : screenPos.Y;
         Location = new Point(screenPos.X, y);
 
-        // start scroll position so selected item is visible
         if (current > MAX_ROWS / 2)
             scrollTop = Math.Max(0, Math.Min(current - MAX_ROWS / 2, items.Count - MAX_ROWS));
 
@@ -693,7 +679,8 @@ internal class FlyoutList : Form
     void HandleClick(object? s, MouseEventArgs e)
     {
         if (e.Button != MouseButtons.Left) return;
-        if (NeedsSB && e.X >= Width - SB_W - 2) return; // scrollbar click, ignore
+        if (NeedsSB && e.X >= Width - SB_W - 2) return;
+
         int idx = (e.Y - 1) / ROW_H + scrollTop;
         if (idx >= 0 && idx < options.Count) ItemChosen?.Invoke(this, idx);
     }
@@ -748,7 +735,6 @@ internal class FlyoutList : Form
             if (isHov)      g.FillRectangle(new SolidBrush(hoverBg), rowRect);
             else if (isSel) g.FillRectangle(new SolidBrush(selBg),   rowRect);
 
-            // 2px left accent bar for the currently selected item
             if (isSel)
                 g.FillRectangle(Brushes.Gray, new Rectangle(1, rowRect.Y, 2, rowRect.Height));
 
@@ -787,12 +773,12 @@ public record WavFormat(ushort Tag, ushort Channels, uint SampleRate, ushort Bit
 
 public class LoopbackRecorder : IDisposable
 {
-    // WASAPI GUIDs and constants — not worth pulling in an extra dependency for these
+
     const int CLSCTX_ALL = 23, eRender = 0, eConsole = 1, STGM_READ = 0, SHARED_MODE = 0;
     const int S_OK = 0;
     const uint LOOPBACK_FLAG = 0x00020000, AUTOCONVERT = 0x80000000, SRC_QUALITY = 0x08000000;
     const uint SILENT_PACKET = 2;
-    const int TARGET_SR = 44100; // 44.1k is plenty for clips, no need for 48k
+    const int TARGET_SR = 44100;
 
     static readonly Guid MMDevEnum_CLSID  = new("BCDE0395-E52F-467C-8E3D-C4579291692E");
     static readonly Guid MMDevEnum_IID    = new("A95664D2-9614-4F35-A746-DE8DB63617E6");
@@ -821,7 +807,8 @@ public class LoopbackRecorder : IDisposable
         running    = true;
         loopThread = new Thread(ThreadMain) { IsBackground = true, Name = "wasapi-loopback" };
         loopThread.Start();
-        bool started = startedEvent.Wait(3000); // 3s should be more than enough for any normal device
+        bool started = startedEvent.Wait(3000);
+
         if (!started) {
             running = false;
             return false;
@@ -833,7 +820,8 @@ public class LoopbackRecorder : IDisposable
 
     void ThreadMain()
     {
-        CoInitializeEx(IntPtr.Zero, 0); // STA — required before any COM calls on this thread
+        CoInitializeEx(IntPtr.Zero, 0);
+
         try   { CaptureAudio(); }
         catch (Exception ex) { System.Diagnostics.Debug.WriteLine("loopback thread: " + ex.Message); }
         finally { CoUninitialize(); }
@@ -861,10 +849,9 @@ public class LoopbackRecorder : IDisposable
                 var nativeFmt = Marshal.PtrToStructure<WAVEFORMATEX>(nativeFmtPtr);
                 Marshal.FreeCoTaskMem(nativeFmtPtr);
 
-                // request float32 @ 44100 — cleaner than whatever the device native format is
-                // AUTOCONVERT flag lets the driver resample for us
                 var wantedFmt = new WAVEFORMATEX {
-                    wFormatTag      = 3, // IEEE_FLOAT
+                    wFormatTag      = 3,
+
                     nChannels       = 2,
                     nSamplesPerSec  = TARGET_SR,
                     wBitsPerSample  = 32,
@@ -877,7 +864,7 @@ public class LoopbackRecorder : IDisposable
                     10_000_000, 0, ref wantedFmt, IntPtr.Zero);
 
                 if (hr != S_OK) {
-                    // some drivers refuse AUTOCONVERT — fall back to whatever the device outputs natively
+
                     hr = audioClient.Initialize(SHARED_MODE, LOOPBACK_FLAG, 10_000_000, 0, ref nativeFmt, IntPtr.Zero);
                     if (hr != S_OK) return;
                     CaptureFormat = new WavFormat(nativeFmt.wFormatTag, nativeFmt.nChannels, nativeFmt.nSamplesPerSec, nativeFmt.wBitsPerSample);
@@ -905,7 +892,7 @@ public class LoopbackRecorder : IDisposable
                         {
                             int byteCount = (int)(nFrames * (uint)frameBytes);
                             var buf = new byte[byteCount];
-                            // AUDCLNT_BUFFERFLAGS_SILENT (0x2) means the device output silence — send zeroed buf
+
                             if ((flags & SILENT_PACKET) == 0 && ptr != IntPtr.Zero)
                                 Marshal.Copy(ptr, buf, 0, byteCount);
                             dataCallback(buf, byteCount);
@@ -948,7 +935,8 @@ public class LoopbackRecorder : IDisposable
             dev.OpenPropertyStore(STGM_READ, out var store);
             var k = new PROPKEY { fmtid = FriendlyName_Key, pid = FriendlyName_PID };
             store.GetValue(ref k, out var pv);
-            if (pv.vt == 31) return Marshal.PtrToStringUni(pv.ptr); // 31 = VT_LPWSTR
+            if (pv.vt == 31) return Marshal.PtrToStringUni(pv.ptr);
+
         }
         catch (COMException) { }
         return null;
@@ -1069,8 +1057,6 @@ public class ScreenGrabber
     readonly Action<byte[], double> frameCallback;
     readonly CancellationToken cancel;
 
-    // 78 gives decent quality without the file sizes ballooning
-    // tried 85 but the ring buffer would OOM after a few minutes at 1080p
     const int JpegQuality = 78;
 
     static readonly ImageCodecInfo JpegEncoder = ImageCodecInfo.GetImageEncoders()
@@ -1109,7 +1095,7 @@ public class ScreenGrabber
             try { gfx.CopyFromScreen(captureRect.Location, Point.Empty, captureRect.Size); }
             catch (System.ComponentModel.Win32Exception)
             {
-                // screen probably locked or on the secure desktop — skip and keep trying
+
                 DroppedFrames++;
                 Thread.Sleep(33);
                 continue;
@@ -1138,8 +1124,6 @@ public class ScreenGrabber
         }
     }
 
-    // scales to fit target height while keeping aspect ratio
-    // & ~1 forces even dimensions — h264 encoders reject odd widths/heights
     public static Size ScaleToHeight(Rectangle monitor, string label)
     {
         int targetH = label switch { "360p" => 360, "720p" => 720, _ => 1080 };
@@ -1163,7 +1147,6 @@ static class ClipEncoder
             return;
         }
 
-        // rough space estimate: ~5MB/s for 1080p30, 0.5MB/s audio — warn if tight
         try {
             var drive = new DriveInfo(Path.GetPathRoot(outputDir) ?? "C:\\");
             int clipSecs = videoFrames.Count > 1
@@ -1173,7 +1156,7 @@ static class ClipEncoder
             if (drive.AvailableFreeSpace < estimatedBytes * 2)
                 System.Diagnostics.Debug.WriteLine($"low disk space warning: {drive.AvailableFreeSpace / 1_000_000}MB free");
         }
-        catch (Exception) { /* non-fatal, just a heads-up */ }
+        catch (Exception) {  }
 
         try { Directory.CreateDirectory(outputDir); }
         catch (UnauthorizedAccessException ex) {
@@ -1188,7 +1171,6 @@ static class ClipEncoder
         bool withAudio = audioChunks.Count > 0 && audioFmt != null;
         if (withAudio) WriteWav(wavTmp, audioChunks, audioFmt!);
 
-        // recalculate actual fps from timestamps — drops mess up the declared framerate
         double realFps = fps;
         if (videoFrames.Count >= 2) {
             double span = videoFrames[^1].ts - videoFrames[0].ts;
@@ -1225,7 +1207,7 @@ static class ClipEncoder
                     foreach (var f in videoFrames)
                         proc.StandardInput.BaseStream.Write(f.jpg);
                 }
-                catch (IOException) { /* ffmpeg closed the pipe early, probably ran out of disk */ }
+                catch (IOException) {  }
                 finally {
                     try { proc.StandardInput.Close(); } catch { }
                 }
@@ -1240,7 +1222,7 @@ static class ClipEncoder
 
             if (proc.ExitCode == 0)
             {
-                // include file size in the result so the UI can show it
+
                 string sizeStr = "";
                 try {
                     long bytes = new FileInfo(outFile).Length;
@@ -1251,7 +1233,7 @@ static class ClipEncoder
             }
             else
             {
-                // ffmpeg error output tends to be long, grab the last 300 chars where the actual error usually is
+
                 string errSnip = stderr.Length > 300 ? "…" + stderr[^300..] : stderr;
                 onFinished(false, errSnip);
             }
@@ -1294,7 +1276,8 @@ public class MainForm : Form
 
     const int WM_HOTKEY = 0x0312, WM_NCHITTEST = 0x0084;
     const int HTCAPTION = 2, HTCLIENT = 1;
-    const int HK = 1; // hotkey ID — only ever register one
+    const int HK = 1;
+
     const uint CTRL = 0x0002, ALT = 0x0001, SHIFT = 0x0004, WIN = 0x0008, NO_REPEAT = 0x4000;
 
     [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr hwnd, int id, uint mods, uint vk);
@@ -1323,7 +1306,6 @@ public class MainForm : Form
         ["1 min"]  = 60,
     };
 
-    // ui refs
     Panel       recDot    = null!;
     bool        dotBlink;
     Label       timeLabel = null!, statusLabel = null!;
@@ -1361,8 +1343,7 @@ public class MainForm : Form
     {
         try
         {
-            // rounded corners on win11 — attribute 33 = DWMWA_WINDOW_CORNER_PREFERENCE
-            // value 2 = DWMWCP_ROUND, silently fails on win10 which is fine
+
             try { int v = 2; DwmSetWindowAttribute(Handle, 33, ref v, sizeof(int)); } catch { }
 
             try {
@@ -1461,7 +1442,8 @@ public class MainForm : Form
         closeBtn.Click      += (_, _) => Close();
         closeBtn.MouseEnter += (_, _) => closeBtn.BackColor = Color.FromArgb(0xC4, 0x2B, 0x1D);
         closeBtn.MouseLeave += (_, _) => closeBtn.BackColor = TBAR;
-        minBtn.Click        += (_, _) => ShowWindow(Handle, 6); // SW_MINIMIZE
+        minBtn.Click        += (_, _) => ShowWindow(Handle, 6);
+
         minBtn.MouseEnter   += (_, _) => minBtn.BackColor = Color.FromArgb(0x26, 0x26, 0x26);
         minBtn.MouseLeave   += (_, _) => minBtn.BackColor = TBAR;
 
@@ -1644,7 +1626,8 @@ public class MainForm : Form
             : Math.Max(0, audioDevs.IndexOf(cfg.AudioDevice) + 1);
 
         durPicker.SelectedItem = cfg.ClipLen;
-        if (durPicker.SelectedIndex < 0) durPicker.SelectedIndex = 3; // default to 30 sec
+        if (durPicker.SelectedIndex < 0) durPicker.SelectedIndex = 3;
+
     }
 
     void ScheduleRestart()
@@ -1724,7 +1707,7 @@ public class MainForm : Form
 
         if (hotkeyOk)
             statusLabel.Text = $"Buffering  ·  {cfg.Hotkey}  saves the last {cfg.ClipLen}";
-        // if hotkeyOk is false, RegisterHotkeyFromString already set the error message — don't overwrite it
+
         tickTimer.Start();
     }
 
@@ -1780,7 +1763,6 @@ public class MainForm : Form
         progressBar.SetProgress(elapsed, cap);
         timeLabel.Text = $"{(int)elapsed}s / {cap}s";
 
-        // brief "warming up" indicator while the buffer fills
         if (elapsed < 2 && statusLabel.Text.StartsWith("Buffering"))
             statusLabel.Text = "Warming up…";
         else if (elapsed >= 2 && statusLabel.Text == "Warming up…")
@@ -1812,7 +1794,8 @@ public class MainForm : Form
     {
         if (saving || ffmpegExe == null) return;
         saving = true;
-        Task.Run(PlaySaveChime); // play immediately so user gets instant feedback
+        Task.Run(PlaySaveChime);
+
         statusLabel.Text = "Saving clip…";
 
         int clipSecs = DurationMap.TryGetValue(cfg.ClipLen, out int d) ? d : 30;
@@ -1835,7 +1818,7 @@ public class MainForm : Form
         saving = false;
         if (success)
         {
-            // info = "path/clip_xxx.mp4 (4.2MB)" — split out the path part
+
             string path = info.Contains(' ') ? info[..info.IndexOf(' ')] : info;
             string meta = info.Contains(' ') ? info[info.IndexOf(' ')..].Trim() : "";
             lastClipPath = path;
@@ -1881,7 +1864,7 @@ public class MainForm : Form
 
     static void PlaySaveChime()
     {
-        // mciSendString needs an STA thread — Task.Run uses MTA pool threads which fail silently
+
         var t = new Thread(() =>
         {
             try
