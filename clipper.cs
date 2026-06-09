@@ -1,10 +1,11 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Drawing.Text;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Buffers;
 using Microsoft.Win32;
 
 namespace Atlas;
@@ -268,7 +269,7 @@ static class GameDetector
         ["BlackOps6"]                         = "BO6",
     };
 
-    static readonly char[]          _invalidFileChars = Path.GetInvalidFileNameChars();
+    static readonly HashSet<char>   _invalidFileChars = new(Path.GetInvalidFileNameChars());
     static readonly char[]          _titleSeps        = ['|', '-', '—', '·', ':'];
     static readonly HashSet<string> _skip = new(StringComparer.OrdinalIgnoreCase) {
         "explorer","chrome","firefox","msedge","opera","brave","iexplore",
@@ -282,7 +283,6 @@ static class GameDetector
 
     public static string Detect()
     {
-        // Priority: foreground window at clip time (almost always the game)
         try {
             GetWindowThreadProcessId(GetForegroundWindow(), out uint pid);
             using var proc = Process.GetProcessById((int)pid);
@@ -290,17 +290,14 @@ static class GameDetector
             if (name != null) return name;
         } catch { }
 
-        // Fallback: scan for any known game process
-        var all = Process.GetProcesses();
-        string? found = null;
-        try {
-            foreach (var p in all) {
-                try { if (_known.TryGetValue(p.ProcessName, out string? n) && n != null) { found = n; break; } }
+        foreach (var p in Process.GetProcesses()) {
+            using (p) {
+                try { if (_known.TryGetValue(p.ProcessName, out string? n) && n != null) return n; }
                 catch { }
             }
-        } finally { foreach (var p in all) try { p.Dispose(); } catch { } }
+        }
 
-        return found ?? "clip";
+        return "clip";
     }
 
     static string? Resolve(Process proc)
@@ -308,7 +305,6 @@ static class GameDetector
         if (_skip.Contains(proc.ProcessName)) return null;
         if (_known.TryGetValue(proc.ProcessName, out string? mapped)) return mapped;
 
-        // Use window title — take the first segment before a separator
         string title = "";
         try { title = proc.MainWindowTitle; } catch { }
         if (title.Length > 1) {
@@ -459,9 +455,9 @@ static class DwmHelper
     [DllImport("dwmapi.dll")] static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int val, int size);
     public static void Apply(IntPtr hwnd)
     {
-        TrySet(hwnd, 20, 1);  // dark mode
-        TrySet(hwnd, 33, 2);  // rounded corners (Win11)
-        TrySet(hwnd, 38, 2);  // Mica backdrop (Win11 22H2+)
+        TrySet(hwnd, 20, 1);
+        TrySet(hwnd, 33, 2);
+        TrySet(hwnd, 38, 2);
     }
     static void TrySet(IntPtr hwnd, int attr, int val)
     { try { DwmSetWindowAttribute(hwnd, attr, ref val, sizeof(int)); } catch { } }
@@ -1218,7 +1214,7 @@ public class LoopbackRecorder : IDisposable
 
     const int CLSCTX_ALL = 23, eRender = 0, eConsole = 1, STGM_READ = 0, SHARED_MODE = 0;
     const int S_OK = 0;
-    const uint LOOPBACK_FLAG = 0x00020000, AUTOCONVERT = 0x80000000, SRC_QUALITY = 0x08000000;
+    const uint LOOPBACK_FLAG = 0x00020000, AUTOCONVERT = 0x80000000, SRC_QUALITY = 0x08000000, AUDCLNT_STREAMFLAGS_EVENTCALLBACK = 0x00040000;
     const uint SILENT_PACKET = 2;
     const int TARGET_SR = 44100;
 
@@ -1297,7 +1293,6 @@ public class LoopbackRecorder : IDisposable
 
                 var wantedFmt = new WAVEFORMATEX {
                     wFormatTag      = 3,
-
                     nChannels       = 2,
                     nSamplesPerSec  = TARGET_SR,
                     wBitsPerSample  = 32,
@@ -1306,51 +1301,92 @@ public class LoopbackRecorder : IDisposable
                     cbSize          = 0,
                 };
 
-                uint initFlags = captureMode ? AUTOCONVERT | SRC_QUALITY : LOOPBACK_FLAG | AUTOCONVERT | SRC_QUALITY;
-                int hr = audioClient.Initialize(SHARED_MODE, initFlags, 10_000_000, 0, ref wantedFmt, IntPtr.Zero);
+                IntPtr hEvent    = CreateEvent(IntPtr.Zero, false, false, null);
+                bool   evtMode   = false;
+                uint   baseFlags = captureMode ? 0u : LOOPBACK_FLAG;
 
-                if (hr != S_OK) {
-
-                    uint fallbackFlags = captureMode ? 0u : LOOPBACK_FLAG;
-                    hr = audioClient.Initialize(SHARED_MODE, fallbackFlags, 10_000_000, 0, ref nativeFmt, IntPtr.Zero);
-                    if (hr != S_OK) return;
-                    CaptureFormat = new WavFormat(nativeFmt.wFormatTag, nativeFmt.nChannels, nativeFmt.nSamplesPerSec, nativeFmt.wBitsPerSample);
-                } else {
-                    CaptureFormat = new WavFormat(3, 2, TARGET_SR, 32);
+                if (hEvent != IntPtr.Zero) {
+                    uint ef   = baseFlags | AUTOCONVERT | SRC_QUALITY | AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+                    int  evhr = audioClient.Initialize(SHARED_MODE, ef, 0, 0, ref wantedFmt, IntPtr.Zero);
+                    if (evhr == S_OK) { CaptureFormat = new WavFormat(3, 2, TARGET_SR, 32); evtMode = true; }
+                    else {
+                        evhr = audioClient.Initialize(SHARED_MODE, baseFlags | AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 0, 0, ref nativeFmt, IntPtr.Zero);
+                        if (evhr == S_OK) { CaptureFormat = new WavFormat(nativeFmt.wFormatTag, nativeFmt.nChannels, nativeFmt.nSamplesPerSec, nativeFmt.wBitsPerSample); evtMode = true; }
+                    }
                 }
 
+                if (!evtMode) {
+                    uint pf = baseFlags | AUTOCONVERT | SRC_QUALITY;
+                    int  hr = audioClient.Initialize(SHARED_MODE, pf, 10_000_000, 0, ref wantedFmt, IntPtr.Zero);
+                    if (hr == S_OK) CaptureFormat = new WavFormat(3, 2, TARGET_SR, 32);
+                    else {
+                        hr = audioClient.Initialize(SHARED_MODE, baseFlags, 10_000_000, 0, ref nativeFmt, IntPtr.Zero);
+                        if (hr != S_OK) { if (hEvent != IntPtr.Zero) CloseHandle(hEvent); return; }
+                        CaptureFormat = new WavFormat(nativeFmt.wFormatTag, nativeFmt.nChannels, nativeFmt.nSamplesPerSec, nativeFmt.wBitsPerSample);
+                    }
+                }
+
+                if (evtMode) audioClient.SetEventHandle(hEvent);
+
                 var ccIID = CapClient_IID;
-                if (audioClient.GetService(ref ccIID, out var capRaw) != S_OK) return;
+                if (audioClient.GetService(ref ccIID, out var capRaw) != S_OK) {
+                    if (hEvent != IntPtr.Zero) CloseHandle(hEvent);
+                    return;
+                }
                 var captureClient = (IAudioCaptureClient)capRaw;
 
                 try
                 {
                     audioClient.Start();
                     startedEvent.Set();
-                    int frameBytes = CaptureFormat.BlockAlign;
+                    int frameBytes = CaptureFormat!.BlockAlign;
 
-                    while (running)
-                    {
-                        captureClient.GetNextPacketSize(out uint frameCount);
-                        if (frameCount == 0) { Thread.Sleep(5); continue; }
-
-                        int ghr = captureClient.GetBuffer(out var ptr, out uint nFrames, out uint flags, out _, out _);
-                        if (ghr == S_OK && nFrames > 0)
-                        {
-                            int byteCount = (int)(nFrames * (uint)frameBytes);
-                            var buf = GC.AllocateUninitializedArray<byte>(byteCount);
-
-                            if ((flags & SILENT_PACKET) == 0 && ptr != IntPtr.Zero)
-                                Marshal.Copy(ptr, buf, 0, byteCount);
-                            dataCallback(buf, byteCount);
-                            captureClient.ReleaseBuffer(nFrames);
+                    if (evtMode) {
+                        uint waitMs = captureMode ? 500u : 20u;
+                        while (running) {
+                            WaitForSingleObject(hEvent, waitMs);
+                            if (!running) break;
+                            captureClient.GetNextPacketSize(out uint pktSize);
+                            while (pktSize > 0 && running) {
+                                int ghr = captureClient.GetBuffer(out var ptr, out uint nFrames, out uint flags, out _, out _);
+                                if (ghr == S_OK && nFrames > 0) {
+                                    int byteCount = (int)(nFrames * (uint)frameBytes);
+                                    var buf = ArrayPool<byte>.Shared.Rent(byteCount);
+                                    if ((flags & SILENT_PACKET) == 0 && ptr != IntPtr.Zero)
+                                        Marshal.Copy(ptr, buf, 0, byteCount);
+                                    else
+                                        Array.Clear(buf, 0, byteCount);
+                                    dataCallback(buf, byteCount);
+                                    captureClient.ReleaseBuffer(nFrames);
+                                } else { LatePackets++; break; }
+                                captureClient.GetNextPacketSize(out pktSize);
+                            }
                         }
-                        else LatePackets++;
+                    } else {
+                        while (running) {
+                            captureClient.GetNextPacketSize(out uint frameCount);
+                            if (frameCount == 0) { Thread.Sleep(5); continue; }
+                            int ghr = captureClient.GetBuffer(out var ptr, out uint nFrames, out uint flags, out _, out _);
+                            if (ghr == S_OK && nFrames > 0) {
+                                int byteCount = (int)(nFrames * (uint)frameBytes);
+                                var buf = ArrayPool<byte>.Shared.Rent(byteCount);
+                                if ((flags & SILENT_PACKET) == 0 && ptr != IntPtr.Zero)
+                                    Marshal.Copy(ptr, buf, 0, byteCount);
+                                else
+                                    Array.Clear(buf, 0, byteCount);
+                                dataCallback(buf, byteCount);
+                                captureClient.ReleaseBuffer(nFrames);
+                            }
+                            else LatePackets++;
+                        }
                     }
 
                     audioClient.Stop();
                 }
-                finally { Marshal.ReleaseComObject(captureClient); }
+                finally {
+                    Marshal.ReleaseComObject(captureClient);
+                    if (hEvent != IntPtr.Zero) CloseHandle(hEvent);
+                }
             }
             finally { Marshal.ReleaseComObject(audioClient); }
         }
@@ -1454,10 +1490,13 @@ public class LoopbackRecorder : IDisposable
 
     public void Dispose() => Stop();
 
-    [DllImport("ole32.dll")] static extern int  CoInitializeEx(IntPtr r, int apt);
-    [DllImport("ole32.dll")] static extern void CoUninitialize();
-    [DllImport("ole32.dll")] static extern int  CoCreateInstance(ref Guid cls, IntPtr outer, int ctx, ref Guid iid,
+    [DllImport("ole32.dll")]    static extern int    CoInitializeEx(IntPtr r, int apt);
+    [DllImport("ole32.dll")]    static extern void   CoUninitialize();
+    [DllImport("ole32.dll")]    static extern int    CoCreateInstance(ref Guid cls, IntPtr outer, int ctx, ref Guid iid,
         [MarshalAs(UnmanagedType.IUnknown)] out object ppv);
+    [DllImport("kernel32.dll")] static extern IntPtr CreateEvent(IntPtr attr, bool manualReset, bool initial, string? name);
+    [DllImport("kernel32.dll")] static extern uint   WaitForSingleObject(IntPtr h, uint ms);
+    [DllImport("kernel32.dll")] static extern bool   CloseHandle(IntPtr h);
 
     [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
     interface IMMDeviceEnumerator {
@@ -1521,10 +1560,136 @@ public class LoopbackRecorder : IDisposable
     struct PROPVAR  { [FieldOffset(0)] public ushort vt; [FieldOffset(8)] public IntPtr ptr; }
 }
 
+sealed class LiveEncoder : IDisposable
+{
+    readonly Action<byte[], int, double>  _onPacket;
+    readonly Process                      _proc;
+    readonly Thread                       _writer, _reader;
+    readonly System.Collections.Concurrent.BlockingCollection<(byte[] buf, int len, double pts)>
+        _queue = new(new System.Collections.Concurrent.ConcurrentQueue<(byte[], int, double)>(), 6);
+    readonly System.Collections.Concurrent.ConcurrentQueue<double> _ptsQ = new();
+    volatile bool _alive = true;
+
+    public bool IsAlive => _alive;
+
+    public static LiveEncoder? TryCreate(int w, int h, int fps, string encoder, string ffmpegPath,
+        Action<byte[], int, double> onPacket)
+    {
+        try   { return new LiveEncoder(w, h, fps, encoder, ffmpegPath, onPacket); }
+        catch { return null; }
+    }
+
+    LiveEncoder(int w, int h, int fps, string encoder, string ffmpegPath,
+        Action<byte[], int, double> onPacket)
+    {
+        _onPacket = onPacket;
+        var args = new List<string> {
+            "-f", "rawvideo", "-pix_fmt", "bgra",
+            "-s", $"{w}x{h}",
+            "-r", fps.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            "-i", "pipe:0", "-an"
+        };
+        switch (encoder) {
+            case "h264_nvenc":
+                args.AddRange(["-c:v", "h264_nvenc", "-preset", "p1", "-rc", "cbr",
+                    "-b:v", "8M", "-g", "1", "-bf", "0", "-bsf:v", "dump_extra"]);
+                break;
+            case "h264_amf":
+                args.AddRange(["-c:v", "h264_amf", "-quality", "speed",
+                    "-gops_per_idr", "1", "-bf", "0", "-bsf:v", "dump_extra"]);
+                break;
+            case "h264_qsv":
+                args.AddRange(["-c:v", "h264_qsv", "-preset", "veryfast",
+                    "-g", "1", "-bf", "0", "-bsf:v", "dump_extra"]);
+                break;
+            default:
+                args.AddRange(["-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+                    "-g", "1", "-bf", "0", "-x264-params", "repeat_headers=1"]);
+                break;
+        }
+        args.AddRange(["-f", "h264", "pipe:1"]);
+
+        var psi = new ProcessStartInfo(ffmpegPath) {
+            UseShellExecute = false, RedirectStandardInput = true,
+            RedirectStandardOutput = true, RedirectStandardError = true,
+            CreateNoWindow = true,
+        };
+        foreach (var a in args) psi.ArgumentList.Add(a);
+        _proc = Process.Start(psi) ?? throw new InvalidOperationException("ffmpeg start failed");
+        _proc.StandardError.ReadToEndAsync();
+
+        _writer = new Thread(WriteLoop) { IsBackground = true, Name = "enc-in"  };
+        _reader = new Thread(ReadLoop)  { IsBackground = true, Name = "enc-out" };
+        _writer.Start();
+        _reader.Start();
+    }
+
+    public bool Submit(byte[] buf, int len, double pts)
+    {
+        if (!_alive) return false;
+        return _queue.TryAdd((buf, len, pts));
+    }
+
+    void WriteLoop()
+    {
+        foreach (var (buf, len, pts) in _queue.GetConsumingEnumerable()) {
+            _ptsQ.Enqueue(pts);
+            try   { _proc.StandardInput.BaseStream.Write(buf, 0, len); }
+            catch { _alive = false; }
+            ArrayPool<byte>.Shared.Return(buf);
+        }
+        try { _proc.StandardInput.Close(); } catch { }
+    }
+
+    void ReadLoop()
+    {
+        var acc    = new MemoryStream(128 * 1024);
+        var buf    = new byte[65536];
+        var stream = _proc.StandardOutput.BaseStream;
+        int n;
+        while ((n = stream.Read(buf, 0, buf.Length)) > 0) {
+            int seg = 0;
+            for (int i = 0; i <= n - 5; i++) {
+                if (buf[i] == 0 && buf[i+1] == 0 && buf[i+2] == 0 && buf[i+3] == 1 &&
+                    (buf[i+4] & 0x1F) == 7) {
+                    acc.Write(buf, seg, i - seg);
+                    if (acc.Length > 0) Emit(acc);
+                    acc.SetLength(0);
+                    seg = i;
+                }
+            }
+            acc.Write(buf, seg, n - seg);
+        }
+        if (acc.Length > 0) Emit(acc);
+        _alive = false;
+    }
+
+    void Emit(MemoryStream ms)
+    {
+        _ptsQ.TryDequeue(out double pts);
+        int len = (int)ms.Length;
+        var data = GC.AllocateUninitializedArray<byte>(len);
+        ms.GetBuffer().AsSpan(0, len).CopyTo(data);
+        _onPacket(data, len, pts);
+    }
+
+    public void Dispose()
+    {
+        _alive = false;
+        _queue.CompleteAdding();
+        _writer.Join(2000);
+        _reader.Join(2000);
+        try { _proc.Kill(); } catch { }
+        _proc.Dispose();
+    }
+}
+
 public class ScreenGrabber
 {
     [DllImport("user32.dll")] static extern bool GetCursorInfo(out CURSORINFO pci);
     [DllImport("user32.dll")] static extern bool DrawIconEx(IntPtr hdc, int x, int y, IntPtr hIcon, int cxW, int cyH, int step, IntPtr hBrush, uint flags);
+    [DllImport("winmm.dll")] static extern uint timeBeginPeriod(uint uPeriod);
+    [DllImport("winmm.dll")] static extern uint timeEndPeriod(uint uPeriod);
     [StructLayout(LayoutKind.Sequential)] struct POINT { public int X, Y; }
     [StructLayout(LayoutKind.Sequential)] struct CURSORINFO { public int cbSize, flags; public IntPtr hCursor; public POINT pt; }
     const int CURSOR_SHOWING = 1; const uint DI_NORMAL = 3;
@@ -1535,6 +1700,8 @@ public class ScreenGrabber
     readonly Action<byte[], double> frameCallback;
     readonly CancellationToken cancel;
     readonly bool drawCursor;
+    readonly string? _ffmpegPath;
+    readonly string  _encoder;
 
     const int JpegQuality = 78;
 
@@ -1549,33 +1716,47 @@ public class ScreenGrabber
     uint _prevHash;
     bool _hasPrevHash;
 
-    public ScreenGrabber(Rectangle region, Size outSize, int fps, Action<byte[], double> onFrame, CancellationToken ct, bool drawCursor = true)
+    public ScreenGrabber(Rectangle region, Size outSize, int fps, Action<byte[], double> onFrame,
+        CancellationToken ct, bool drawCursor = true, string? ffmpegPath = null, string encoder = "")
     {
-        captureRect    = region;
-        outputSize     = outSize;
-        targetFps      = fps;
-        frameCallback  = onFrame;
-        cancel         = ct;
+        captureRect     = region;
+        outputSize      = outSize;
+        targetFps       = fps;
+        frameCallback   = onFrame;
+        cancel          = ct;
         this.drawCursor = drawCursor;
+        _ffmpegPath     = ffmpegPath;
+        _encoder        = encoder;
     }
 
-    // Fast FNV-1a bitmap hash: samples a grid of pixels to detect static frames cheaply (~0.5ms).
-    static uint BitmapHash(Bitmap bmp)
+    static unsafe uint BitmapHash(Bitmap bmp)
     {
         var data = bmp.LockBits(new Rectangle(0, 0, bmp.Width, bmp.Height),
                                  ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
         try {
-            int stepX = Math.Max(1, data.Width  / 32);
-            int stepY = Math.Max(1, data.Height / 24);
-            uint hash = 2166136261u;
-            for (int y = 0; y < data.Height; y += stepY)
-                for (int x = 0; x < data.Width; x += stepX)
-                    hash = (hash ^ (uint)Marshal.ReadInt32(data.Scan0, y * data.Stride + x * 4)) * 16777619u;
+            int stepX  = Math.Max(1, data.Width  / 32);
+            int stepY  = Math.Max(1, data.Height / 24);
+            uint hash  = 2166136261u;
+            byte* scan0 = (byte*)data.Scan0;
+            int stride  = data.Stride;
+            int height  = data.Height;
+            int width   = data.Width;
+            for (int y = 0; y < height; y += stepY) {
+                uint* row = (uint*)(scan0 + y * stride);
+                for (int x = 0; x < width; x += stepX)
+                    hash = (hash ^ row[x]) * 16777619u;
+            }
             return hash;
         } finally { bmp.UnlockBits(data); }
     }
 
     public void Run()
+    {
+        if (!TryRunDxgi() && !TryRunDxgi())
+            RunGdi();
+    }
+
+    void RunGdi()
     {
         bool needsScale = outputSize.Width != captureRect.Width || outputSize.Height != captureRect.Height;
 
@@ -1591,68 +1772,352 @@ public class ScreenGrabber
             scaledGfx.PixelOffsetMode   = System.Drawing.Drawing2D.PixelOffsetMode.None;
         }
 
-        var interval = TimeSpan.FromSeconds(1.0 / targetFps);
-        var nextTick = DateTime.UtcNow;
-        int frameCount = 0;
-        var fpsTimer   = DateTime.UtcNow;
+        var sw             = Stopwatch.StartNew();
+        long ticksPerFrame = (long)(Stopwatch.Frequency / (double)targetFps);
+        long nextTick      = 0L;
+        int  frameCount    = 0;
+        long fpsMark       = 0L;
 
-        while (!cancel.IsCancellationRequested)
+        timeBeginPeriod(1);
+        try
         {
-            var now = DateTime.UtcNow;
-            double ts = (now - DateTime.UnixEpoch).TotalSeconds;
-
-            try { gfx.CopyFromScreen(captureRect.Location, Point.Empty, captureRect.Size); }
-            catch (System.ComponentModel.Win32Exception)
+            while (!cancel.IsCancellationRequested)
             {
-                DroppedFrames++;
-                Thread.Sleep(33);
-                continue;
-            }
-            if (drawCursor) {
-                var ci = new CURSORINFO { cbSize = _cursorInfoSize };
-                if (GetCursorInfo(out ci) && (ci.flags & CURSOR_SHOWING) != 0) {
-                    int cx = ci.pt.X - captureRect.X, cy = ci.pt.Y - captureRect.Y;
-                    if (cx > -64 && cx < captureRect.Width + 64 && cy > -64 && cy < captureRect.Height + 64) {
-                        var hdc = gfx.GetHdc();
-                        try { DrawIconEx(hdc, cx, cy, ci.hCursor, 0, 0, 0, IntPtr.Zero, DI_NORMAL); }
-                        finally { gfx.ReleaseHdc(hdc); }
+                double ts = (DateTime.UtcNow - DateTime.UnixEpoch).TotalSeconds;
+
+                try { gfx.CopyFromScreen(captureRect.Location, Point.Empty, captureRect.Size); }
+                catch (System.ComponentModel.Win32Exception)
+                {
+                    DroppedFrames++;
+                    Thread.Sleep(33);
+                    nextTick = sw.ElapsedTicks;
+                    continue;
+                }
+                if (drawCursor) {
+                    var ci = new CURSORINFO { cbSize = _cursorInfoSize };
+                    if (GetCursorInfo(out ci) && (ci.flags & CURSOR_SHOWING) != 0) {
+                        int cx = ci.pt.X - captureRect.X, cy = ci.pt.Y - captureRect.Y;
+                        if (cx > -64 && cx < captureRect.Width + 64 && cy > -64 && cy < captureRect.Height + 64) {
+                            var hdc = gfx.GetHdc();
+                            try { DrawIconEx(hdc, cx, cy, ci.hCursor, 0, 0, 0, IntPtr.Zero, DI_NORMAL); }
+                            finally { gfx.ReleaseHdc(hdc); }
+                        }
                     }
                 }
-            }
 
-            Bitmap toEncode = bmp;
-            if (needsScale) {
-                scaledGfx!.DrawImage(bmp, 0, 0, outputSize.Width, outputSize.Height);
-                toEncode = scaled!;
-            }
+                uint fh = BitmapHash(bmp);
+                bool isNew = !_hasPrevHash || fh != _prevHash;
+                _prevHash = fh; _hasPrevHash = true;
+                if (isNew) {
+                    Bitmap toEncode = bmp;
+                    if (needsScale) {
+                        scaledGfx!.DrawImage(bmp, 0, 0, outputSize.Width, outputSize.Height);
+                        toEncode = scaled!;
+                    }
+                    ms.SetLength(0);
+                    toEncode.Save(ms, JpegEncoder, EncParams);
+                    int frameLen = (int)ms.Length;
+                    var frame = GC.AllocateUninitializedArray<byte>(frameLen);
+                    ms.GetBuffer().AsSpan(0, frameLen).CopyTo(frame);
+                    frameCallback(frame, ts);
+                }
 
-            // Static-frame skip: hash the captured bitmap; if identical to previous, skip JPEG encode.
-            // FFmpeg's -vf fps filter will repeat the last frame to fill the gap in the output clip.
-            uint fh = BitmapHash(bmp);
-            bool isNew = !_hasPrevHash || fh != _prevHash;
-            _prevHash = fh; _hasPrevHash = true;
-            if (isNew) {
-                ms.SetLength(0);
-                toEncode.Save(ms, JpegEncoder, EncParams);
-                int frameLen = (int)ms.Length;
-                var frame = GC.AllocateUninitializedArray<byte>(frameLen);
-                ms.GetBuffer().AsSpan(0, frameLen).CopyTo(frame);
-                frameCallback(frame, ts);
-            }
+                frameCount++;
+                long nowAfterTicks = sw.ElapsedTicks;
+                if ((double)(nowAfterTicks - fpsMark) / Stopwatch.Frequency >= 1.0) {
+                    ActualFps = frameCount;
+                    frameCount = 0;
+                    fpsMark = nowAfterTicks;
+                }
 
-            frameCount++;
-            var nowAfter = DateTime.UtcNow;
-            if ((nowAfter - fpsTimer).TotalSeconds >= 1.0) {
-                ActualFps = frameCount;
-                frameCount = 0;
-                fpsTimer = nowAfter;
+                nextTick += ticksPerFrame;
+                long remaining = nextTick - sw.ElapsedTicks;
+                if (remaining > 0) {
+                    int sleepMs = (int)(remaining * 1000L / Stopwatch.Frequency);
+                    if (sleepMs > 0) Thread.Sleep(sleepMs);
+                }
+                else DroppedFrames++;
             }
-
-            nextTick += interval;
-            var delay = nextTick - nowAfter;
-            if (delay > TimeSpan.Zero) Thread.Sleep(delay);
-            else DroppedFrames++;
         }
+        finally { timeEndPeriod(1); }
+    }
+
+    static readonly Guid _IIDFactory1 = new("770aae78-f26f-4dba-a829-253c83d1b387");
+    const int  _HW    = 1, _BGRA = unchecked((int)0x20), _STAGING = 3, _MAP_READ = 1;
+    const uint _SDK   = 7, _CPU_R = 0x20000;
+    const int  _FMT_B8G8R8A8 = 87;
+    const int  _DTIMEOUT = unchecked((int)0x887A0027);
+    const int  _DLOST    = unchecked((int)0x887A0026);
+
+    [DllImport("dxgi.dll")]   static extern int CreateDXGIFactory1(ref Guid r, [MarshalAs(UnmanagedType.IUnknown)] out object f);
+    [DllImport("d3d11.dll")]  static extern int D3D11CreateDevice([MarshalAs(UnmanagedType.IUnknown)] object? a, int dt,
+        IntPtr sw, int fl, IntPtr pfl, uint nfl, uint sdk,
+        [MarshalAs(UnmanagedType.IUnknown)] out object dev, out int fl2,
+        [MarshalAs(UnmanagedType.IUnknown)] out object ctx);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct DXGI_OUTPUT_DESC {
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string DeviceName;
+        public int left, top, right, bottom;
+        public int AttachedToDesktop, Rotation;
+        public IntPtr Monitor;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    struct DXGI_FRAME_INFO {
+        public long LastPresentTime, LastMouseUpdateTime;
+        public uint AccumulatedFrames;
+        public int  RectsCoalesced, ProtectedMasked;
+        public int  PtrX, PtrY, PtrVisible;
+        public uint TotalMetadata, PointerShapeSize;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    struct D3D11_TEX2D_DESC {
+        public uint W, H, Mips, Arrays, Format, SampleCnt, SampleQuality;
+        public int  Usage;
+        public uint BindFlags, CPUFlags, MiscFlags;
+    }
+    [StructLayout(LayoutKind.Sequential)]
+    struct D3D11_MAPPED { public IntPtr pData; public uint RowPitch, DepthPitch; }
+
+    [ComImport, Guid("770aae78-f26f-4dba-a829-253c83d1b387"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IDXGIFactory1 {
+        [PreserveSig] int _s0(); [PreserveSig] int _s1(); [PreserveSig] int _s2(); [PreserveSig] int _s3();
+        [PreserveSig] int _s4(); [PreserveSig] int _s5(); [PreserveSig] int _s6(); [PreserveSig] int _s7(); [PreserveSig] int _s8();
+        [PreserveSig] int EnumAdapters1(uint idx, [MarshalAs(UnmanagedType.IUnknown)] out object adapter);
+        [PreserveSig] int _s10();
+    }
+    [ComImport, Guid("29038f61-3839-4626-91fd-086879011a05"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IDXGIAdapter1 {
+        [PreserveSig] int _s0(); [PreserveSig] int _s1(); [PreserveSig] int _s2(); [PreserveSig] int _s3();
+        [PreserveSig] int EnumOutputs(uint idx, [MarshalAs(UnmanagedType.IUnknown)] out object output);
+        [PreserveSig] int _s5(); [PreserveSig] int _s6(); [PreserveSig] int _s7();
+    }
+    [ComImport, Guid("ae02eedb-c735-4690-8d52-5a8dc20213aa"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IDXGIOutput {
+        [PreserveSig] int _s0(); [PreserveSig] int _s1(); [PreserveSig] int _s2(); [PreserveSig] int _s3();
+        [PreserveSig] int GetDesc(out DXGI_OUTPUT_DESC d);
+        [PreserveSig] int _s5(); [PreserveSig] int _s6(); [PreserveSig] int _s7(); [PreserveSig] int _s8();
+        [PreserveSig] int _s9(); [PreserveSig] int _s10(); [PreserveSig] int _s11(); [PreserveSig] int _s12();
+        [PreserveSig] int _s13(); [PreserveSig] int _s14(); [PreserveSig] int _s15();
+    }
+    [ComImport, Guid("00cddea8-939b-4b83-a340-a685226666cc"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IDXGIOutput1 {
+        [PreserveSig] int _s0(); [PreserveSig] int _s1(); [PreserveSig] int _s2(); [PreserveSig] int _s3();
+        [PreserveSig] int _s4(); [PreserveSig] int _s5(); [PreserveSig] int _s6(); [PreserveSig] int _s7();
+        [PreserveSig] int _s8(); [PreserveSig] int _s9(); [PreserveSig] int _s10(); [PreserveSig] int _s11();
+        [PreserveSig] int _s12(); [PreserveSig] int _s13(); [PreserveSig] int _s14(); [PreserveSig] int _s15();
+        [PreserveSig] int _s16(); [PreserveSig] int _s17(); [PreserveSig] int _s18();
+        [PreserveSig] int DuplicateOutput([MarshalAs(UnmanagedType.IUnknown)] object device, out IDXGIOutputDuplication dupl);
+    }
+    [ComImport, Guid("191cfac3-a341-470d-b26e-a864f428319c"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IDXGIOutputDuplication {
+        [PreserveSig] int _s0(); [PreserveSig] int _s1(); [PreserveSig] int _s2(); [PreserveSig] int _s3();
+        [PreserveSig] void _s4(out IntPtr d);
+        [PreserveSig] int AcquireNextFrame(uint ms, out DXGI_FRAME_INFO info,
+            [MarshalAs(UnmanagedType.IUnknown)] out object resource);
+        [PreserveSig] int _s6(); [PreserveSig] int _s7(); [PreserveSig] int _s8();
+        [PreserveSig] int _s9(); [PreserveSig] int _s10();
+        [PreserveSig] int ReleaseFrame();
+    }
+    [ComImport, Guid("db6f6ddb-ac77-4e88-8253-819df9bbf140"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface ID3D11Device {
+        [PreserveSig] int _s0(); [PreserveSig] int _s1();
+        [PreserveSig] int CreateTexture2D(ref D3D11_TEX2D_DESC d, IntPtr init,
+            [MarshalAs(UnmanagedType.IUnknown)] out object tex);
+        [PreserveSig] int _s3(); [PreserveSig] int _s4(); [PreserveSig] int _s5(); [PreserveSig] int _s6();
+        [PreserveSig] int _s7(); [PreserveSig] int _s8(); [PreserveSig] int _s9(); [PreserveSig] int _s10();
+        [PreserveSig] int _s11(); [PreserveSig] int _s12(); [PreserveSig] int _s13(); [PreserveSig] int _s14();
+        [PreserveSig] int _s15(); [PreserveSig] int _s16(); [PreserveSig] int _s17(); [PreserveSig] int _s18();
+        [PreserveSig] int _s19(); [PreserveSig] int _s20(); [PreserveSig] int _s21(); [PreserveSig] int _s22();
+        [PreserveSig] int _s23(); [PreserveSig] int _s24(); [PreserveSig] int _s25(); [PreserveSig] int _s26();
+        [PreserveSig] int _s27(); [PreserveSig] int _s28(); [PreserveSig] int _s29(); [PreserveSig] int _s30();
+        [PreserveSig] int _s31(); [PreserveSig] int _s32(); [PreserveSig] int _s33(); [PreserveSig] int _s34();
+        [PreserveSig] uint _s35(); [PreserveSig] int _s36();
+        [PreserveSig] void GetImmediateContext([MarshalAs(UnmanagedType.IUnknown)] out object ctx);
+        [PreserveSig] int _s38(); [PreserveSig] uint _s39();
+    }
+    [ComImport, Guid("c0bfa96c-e089-44fb-8eaf-26f8796190da"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface ID3D11DeviceContext {
+        [PreserveSig] void _s0([MarshalAs(UnmanagedType.IUnknown)] out object d);
+        [PreserveSig] int  _s1(); [PreserveSig] int _s2(); [PreserveSig] int _s3();
+        [PreserveSig] void _s4();  [PreserveSig] void _s5();  [PreserveSig] void _s6();  [PreserveSig] void _s7();
+        [PreserveSig] void _s8();  [PreserveSig] void _s9();  [PreserveSig] void _s10();
+        [PreserveSig] int  Map([MarshalAs(UnmanagedType.IUnknown)] object res, uint sub, int mapType, uint flags, out D3D11_MAPPED mapped);
+        [PreserveSig] void Unmap([MarshalAs(UnmanagedType.IUnknown)] object res, uint sub);
+        [PreserveSig] void _s13(); [PreserveSig] void _s14(); [PreserveSig] void _s15(); [PreserveSig] void _s16();
+        [PreserveSig] void _s17(); [PreserveSig] void _s18(); [PreserveSig] void _s19(); [PreserveSig] void _s20();
+        [PreserveSig] void _s21(); [PreserveSig] void _s22(); [PreserveSig] void _s23(); [PreserveSig] void _s24();
+        [PreserveSig] void _s25(); [PreserveSig] void _s26(); [PreserveSig] void _s27(); [PreserveSig] void _s28();
+        [PreserveSig] void _s29(); [PreserveSig] void _s30(); [PreserveSig] void _s31(); [PreserveSig] void _s32();
+        [PreserveSig] void _s33(); [PreserveSig] void _s34(); [PreserveSig] void _s35(); [PreserveSig] void _s36();
+        [PreserveSig] void _s37(); [PreserveSig] void _s38(); [PreserveSig] void _s39(); [PreserveSig] void _s40();
+        [PreserveSig] void _s41(); [PreserveSig] void _s42(); [PreserveSig] void _s43();
+        [PreserveSig] void CopyResource([MarshalAs(UnmanagedType.IUnknown)] object dst,
+            [MarshalAs(UnmanagedType.IUnknown)] object src);
+    }
+
+    bool TryRunDxgi()
+    {
+        var fid = _IIDFactory1;
+        if (CreateDXGIFactory1(ref fid, out var factObj) != 0) return false;
+        var factory = (IDXGIFactory1)factObj;
+
+        object? devObj = null, ctxObj = null, stagObj = null;
+        IDXGIOutputDuplication? dupl = null;
+        bool found = false;
+
+        for (uint ai = 0; !found; ai++) {
+            if (factory.EnumAdapters1(ai, out var adObj) != 0) break;
+            var ad = adObj as IDXGIAdapter1;
+            if (ad == null) { Marshal.ReleaseComObject(adObj); break; }
+            for (uint oi = 0; !found; oi++) {
+                if (ad.EnumOutputs(oi, out var outObj) != 0) break;
+                if (outObj is IDXGIOutput outBase && outBase.GetDesc(out var desc) == 0) {
+                    var oRect = new Rectangle(desc.left, desc.top, desc.right - desc.left, desc.bottom - desc.top);
+                    if (oRect.IntersectsWith(captureRect) && outObj is IDXGIOutput1 out1) {
+                        if (D3D11CreateDevice(adObj, 0, IntPtr.Zero, _BGRA, IntPtr.Zero, 0, _SDK,
+                                out devObj, out _, out ctxObj) == 0
+                            && out1.DuplicateOutput(devObj, out dupl) == 0 && dupl != null) {
+                            var dev = (ID3D11Device)devObj;
+                            var sd = new D3D11_TEX2D_DESC {
+                                W = (uint)captureRect.Width, H = (uint)captureRect.Height,
+                                Mips = 1, Arrays = 1, Format = (uint)_FMT_B8G8R8A8,
+                                SampleCnt = 1, SampleQuality = 0, Usage = _STAGING,
+                                BindFlags = 0, CPUFlags = _CPU_R, MiscFlags = 0
+                            };
+                            found = dev.CreateTexture2D(ref sd, IntPtr.Zero, out stagObj) == 0;
+                        }
+                    }
+                }
+                Marshal.ReleaseComObject(outObj);
+            }
+            Marshal.ReleaseComObject(adObj);
+        }
+        Marshal.ReleaseComObject(factObj);
+
+        if (!found) {
+            if (stagObj != null) Marshal.ReleaseComObject(stagObj);
+            if (dupl    != null) Marshal.ReleaseComObject(dupl);
+            if (ctxObj  != null) Marshal.ReleaseComObject(ctxObj);
+            if (devObj  != null) Marshal.ReleaseComObject(devObj);
+            return false;
+        }
+
+        var enc = _ffmpegPath != null
+            ? LiveEncoder.TryCreate(outputSize.Width, outputSize.Height, targetFps,
+                _encoder, _ffmpegPath, (data, len, pts) => frameCallback(data, pts))
+            : null;
+
+        try   { return DxgiLoop((ID3D11DeviceContext)ctxObj!, dupl!, stagObj!, enc); }
+        finally {
+            enc?.Dispose();
+            if (stagObj != null) Marshal.ReleaseComObject(stagObj);
+            if (dupl    != null) Marshal.ReleaseComObject(dupl);
+            if (ctxObj  != null) Marshal.ReleaseComObject(ctxObj);
+            if (devObj  != null) Marshal.ReleaseComObject(devObj);
+        }
+    }
+
+    unsafe bool DxgiLoop(ID3D11DeviceContext ctx, IDXGIOutputDuplication dupl, object staging, LiveEncoder? enc = null)
+    {
+        bool needsScale = outputSize.Width != captureRect.Width || outputSize.Height != captureRect.Height;
+        int  cw = captureRect.Width, ch = captureRect.Height;
+
+        using var bmp       = new Bitmap(cw, ch, PixelFormat.Format32bppArgb);
+        using var gfxCursor = drawCursor ? Graphics.FromImage(bmp) : null;
+        using var ms        = new MemoryStream(256 * 1024);
+        using var scaled    = needsScale ? new Bitmap(outputSize.Width, outputSize.Height, PixelFormat.Format32bppArgb) : null;
+        using var scaledGfx = scaled != null ? Graphics.FromImage(scaled) : null;
+        if (scaledGfx != null) {
+            scaledGfx.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.Low;
+            scaledGfx.SmoothingMode     = System.Drawing.Drawing2D.SmoothingMode.None;
+            scaledGfx.PixelOffsetMode   = System.Drawing.Drawing2D.PixelOffsetMode.None;
+        }
+
+        uint frameMs       = (uint)Math.Max(1, 1000 / targetFps);
+        var  sw            = Stopwatch.StartNew();
+        long ticksPerFrame = (long)(Stopwatch.Frequency / (double)targetFps);
+        long nextTick      = 0L, fpsMark = 0L;
+        int  frameCount    = 0;
+
+        timeBeginPeriod(1);
+        try {
+            while (!cancel.IsCancellationRequested) {
+                double ts = (DateTime.UtcNow - DateTime.UnixEpoch).TotalSeconds;
+
+                int hr = dupl.AcquireNextFrame(frameMs, out _, out var resObj);
+                if (hr == _DLOST) return false;
+
+                bool hasFrame = (hr == 0);
+                if (hasFrame) {
+                    try   { ctx.CopyResource(staging, resObj); }
+                    finally { dupl.ReleaseFrame(); Marshal.ReleaseComObject(resObj); }
+
+                    if (ctx.Map(staging, 0, _MAP_READ, 0, out var mapped) == 0) {
+                        var bd = bmp.LockBits(new Rectangle(0, 0, cw, ch),
+                                              ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+                        byte* src = (byte*)mapped.pData;
+                        byte* dst = (byte*)bd.Scan0;
+                        nint rowBytes = cw * 4, rp = (nint)mapped.RowPitch, st = (nint)bd.Stride;
+                        for (int y = 0; y < ch; y++)
+                            Buffer.MemoryCopy(src + y * rp, dst + y * st, rowBytes, rowBytes);
+                        bmp.UnlockBits(bd);
+                        ctx.Unmap(staging, 0);
+                    }
+
+                    if (drawCursor && gfxCursor != null) {
+                        var ci = new CURSORINFO { cbSize = _cursorInfoSize };
+                        if (GetCursorInfo(out ci) && (ci.flags & CURSOR_SHOWING) != 0) {
+                            int cx2 = ci.pt.X - captureRect.X, cy2 = ci.pt.Y - captureRect.Y;
+                            if (cx2 > -64 && cx2 < cw + 64 && cy2 > -64 && cy2 < ch + 64) {
+                                var hdc = gfxCursor.GetHdc();
+                                try { DrawIconEx(hdc, cx2, cy2, ci.hCursor, 0, 0, 0, IntPtr.Zero, DI_NORMAL); }
+                                finally { gfxCursor.ReleaseHdc(hdc); }
+                            }
+                        }
+                    }
+
+                    Bitmap toEncode = bmp;
+                    if (needsScale && scaledGfx != null) {
+                        scaledGfx.DrawImage(bmp, 0, 0, outputSize.Width, outputSize.Height);
+                        toEncode = scaled!;
+                    }
+
+                    if (enc != null && enc.IsAlive) {
+                        int ew = toEncode.Width, eh = toEncode.Height, rawLen = ew * eh * 4;
+                        var raw = ArrayPool<byte>.Shared.Rent(rawLen);
+                        var bd2 = toEncode.LockBits(new Rectangle(0, 0, ew, eh),
+                                                     ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+                        fixed (byte* dst = raw)
+                            Buffer.MemoryCopy((void*)bd2.Scan0, dst, rawLen, rawLen);
+                        toEncode.UnlockBits(bd2);
+                        if (!enc.Submit(raw, rawLen, ts))
+                            ArrayPool<byte>.Shared.Return(raw);
+                    } else {
+                        ms.SetLength(0);
+                        toEncode.Save(ms, JpegEncoder, EncParams);
+                        int flen  = (int)ms.Length;
+                        var frame = GC.AllocateUninitializedArray<byte>(flen);
+                        ms.GetBuffer().AsSpan(0, flen).CopyTo(frame);
+                        frameCallback(frame, ts);
+                    }
+
+                    frameCount++;
+                    long nowT = sw.ElapsedTicks;
+                    if ((double)(nowT - fpsMark) / Stopwatch.Frequency >= 1.0) {
+                        ActualFps = frameCount;
+                        frameCount = 0;
+                        fpsMark = nowT;
+                    }
+                }
+
+                nextTick += ticksPerFrame;
+                long rem = nextTick - sw.ElapsedTicks;
+                if (rem > 0) { int sl = (int)(rem * 1000L / Stopwatch.Frequency); if (sl > 0) Thread.Sleep(sl); }
+                else if (hasFrame) DroppedFrames++;
+            }
+        } finally { timeEndPeriod(1); }
+        return true;
     }
 
     public static Size ScaleToHeight(Rectangle monitor, string label)
@@ -1668,9 +2133,9 @@ static class ClipEncoder
 {
     public static void WriteClip(
         IList<(double ts, byte[] jpg)> videoFrames,
-        IList<(double ts, byte[] pcm)> audioChunks,
+        IList<(double ts, (byte[] Data, int Len) pcm)> audioChunks,
         WavFormat? audioFmt,
-        IList<(double ts, byte[] pcm)> micChunks,
+        IList<(double ts, (byte[] Data, int Len) pcm)> micChunks,
         WavFormat? micFmt,
         int fps, string outputDir, string ffmpegPath, string format, string encoder,
         string baseName = "clip", int crf = 23,
@@ -1702,6 +2167,16 @@ static class ClipEncoder
         string wavTmp  = Path.Combine(outputDir, $".tmp_audio_{stamp}.wav");
         string outFile = Path.Combine(outputDir, $"{baseName}.{format}");
 
+        bool isH264 = videoFrames.Count > 0 && videoFrames[0].jpg.Length >= 4 &&
+            videoFrames[0].jpg[0] == 0x00 && videoFrames[0].jpg[1] == 0x00 &&
+            videoFrames[0].jpg[2] == 0x00 && videoFrames[0].jpg[3] == 0x01;
+        string? h264Tmp = isH264 ? Path.Combine(outputDir, $".tmp_video_{stamp}.264") : null;
+        if (isH264) {
+            using var vf = new FileStream(h264Tmp!, FileMode.Create, FileAccess.Write,
+                                          FileShare.None, 65536);
+            foreach (var f in videoFrames) vf.Write(f.jpg, 0, f.jpg.Length);
+        }
+
         bool withAudio = audioChunks.Count > 0 && audioFmt != null;
         bool withMic   = micChunks.Count > 0 && micFmt != null;
         if (withAudio) WriteWav(wavTmp, audioChunks, audioFmt!);
@@ -1714,39 +2189,57 @@ static class ClipEncoder
             if (span > 0.5) realFps = Math.Max(1.0, (videoFrames.Count - 1) / span);
         }
 
-        var args = new List<string> {
-            "-y", "-f", "image2pipe",
-            "-framerate", realFps.ToString("F4", System.Globalization.CultureInfo.InvariantCulture),
-            "-i", "pipe:0"
-        };
-        if (withAudio) { args.Add("-i"); args.Add($"\"{wavTmp}\""); }
-        if (withMic)   { args.Add("-i"); args.Add($"\"{micWavTmp}\""); }
-        switch (encoder) {
-            case "h264_nvenc":
-                args.AddRange(["-c:v", "h264_nvenc", "-preset", "p1", "-rc", "vbr", "-cq", crf.ToString(), "-vf", $"fps={fps}"]);
-                break;
-            case "h264_amf":
-                args.AddRange(["-c:v", "h264_amf", "-quality", "speed", "-qp_i", crf.ToString(), "-qp_p", crf.ToString(), "-vf", $"fps={fps}"]);
-                break;
-            case "h264_qsv":
-                args.AddRange(["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", crf.ToString(), "-vf", $"fps={fps}"]);
-                break;
-            default:
-                args.AddRange(["-c:v", "libx264", "-preset", "ultrafast", "-crf", crf.ToString(), "-vf", $"fps={fps}"]);
-                break;
+        List<string> args;
+        if (isH264) {
+            args = new List<string> {
+                "-y",
+                "-r", realFps.ToString("F4", System.Globalization.CultureInfo.InvariantCulture),
+                "-i", h264Tmp!
+            };
+            if (withAudio) { args.Add("-i"); args.Add(wavTmp); }
+            if (withMic)   { args.Add("-i"); args.Add(micWavTmp); }
+            args.AddRange(["-c:v", "copy"]);
+            if (withAudio && withMic)
+                args.AddRange(["-filter_complex", "amix=inputs=2:duration=shortest", "-c:a", "aac", "-b:a", "192k", "-shortest"]);
+            else if (withAudio || withMic)
+                args.AddRange(["-c:a", "aac", "-b:a", "192k", "-shortest"]);
+            args.Add(outFile);
+        } else {
+            args = new List<string> {
+                "-y", "-f", "image2pipe",
+                "-framerate", realFps.ToString("F4", System.Globalization.CultureInfo.InvariantCulture),
+                "-i", "pipe:0"
+            };
+            if (withAudio) { args.Add("-i"); args.Add(wavTmp); }
+            if (withMic)   { args.Add("-i"); args.Add(micWavTmp); }
+            switch (encoder) {
+                case "h264_nvenc":
+                    args.AddRange(["-c:v", "h264_nvenc", "-preset", "p1", "-rc", "vbr", "-cq", crf.ToString(), "-vf", $"fps={fps}"]);
+                    break;
+                case "h264_amf":
+                    args.AddRange(["-c:v", "h264_amf", "-quality", "speed", "-qp_i", crf.ToString(), "-qp_p", crf.ToString(), "-vf", $"fps={fps}"]);
+                    break;
+                case "h264_qsv":
+                    args.AddRange(["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", crf.ToString(), "-vf", $"fps={fps}"]);
+                    break;
+                default:
+                    args.AddRange(["-c:v", "libx264", "-preset", "ultrafast", "-crf", crf.ToString(), "-vf", $"fps={fps}"]);
+                    break;
+            }
+            if (withAudio && withMic)
+                args.AddRange(["-filter_complex", "amix=inputs=2:duration=shortest", "-c:a", "aac", "-b:a", "192k", "-shortest"]);
+            else if (withAudio || withMic)
+                args.AddRange(["-c:a", "aac", "-b:a", "192k", "-shortest"]);
+            args.Add(outFile);
         }
-        if (withAudio && withMic)
-            args.AddRange(["-filter_complex", "amix=inputs=2:duration=shortest", "-c:a", "aac", "-b:a", "192k", "-shortest"]);
-        else if (withAudio || withMic)
-            args.AddRange(["-c:a", "aac", "-b:a", "192k", "-shortest"]);
-        args.Add($"\"{outFile}\"");
 
-        var psi = new ProcessStartInfo(ffmpegPath, string.Join(" ", args)) {
+        var psi = new ProcessStartInfo(ffmpegPath) {
             UseShellExecute       = false,
-            RedirectStandardInput = true,
+            RedirectStandardInput = !isH264,
             RedirectStandardError = true,
             CreateNoWindow        = true,
         };
+        foreach (var a in args) psi.ArgumentList.Add(a);
 
         Process? proc;
         try { proc = Process.Start(psi); }
@@ -1757,23 +2250,27 @@ static class ClipEncoder
         {
             var stderrReader = proc.StandardError.ReadToEndAsync();
 
-            var frameSnapshot = videoFrames.ToArray();
-            var feeder = new Thread(() => {
-                try {
-                    foreach (var f in frameSnapshot)
-                        proc.StandardInput.BaseStream.Write(f.jpg);
-                }
-                catch (IOException) {  }
-                finally {
-                    try { proc.StandardInput.Close(); } catch { }
-                }
-            }) { IsBackground = true };
-            feeder.Start();
+            Thread? feeder = null;
+            if (!isH264) {
+                var frameSnapshot = videoFrames.ToArray();
+                feeder = new Thread(() => {
+                    try {
+                        foreach (var f in frameSnapshot)
+                            proc.StandardInput.BaseStream.Write(f.jpg);
+                    }
+                    catch (IOException) {  }
+                    finally {
+                        try { proc.StandardInput.Close(); } catch { }
+                    }
+                }) { IsBackground = true };
+                feeder.Start();
+            }
 
             string stderr = stderrReader.GetAwaiter().GetResult();
             proc.WaitForExit();
-            feeder.Join(2000);
+            feeder?.Join(2000);
 
+            if (isH264 && h264Tmp != null) { try { File.Delete(h264Tmp); } catch { } }
             if (withAudio) { try { File.Delete(wavTmp);    } catch { } }
             if (withMic)   { try { File.Delete(micWavTmp); } catch { } }
 
@@ -1813,10 +2310,10 @@ static class ClipEncoder
         return "libx264";
     }
 
-    static void WriteWav(string path, IList<(double, byte[])> chunks, WavFormat fmt)
+    static void WriteWav(string path, IList<(double, (byte[] Data, int Len))> chunks, WavFormat fmt)
     {
         int totalBytes = 0;
-        foreach (var (_, pcm) in chunks) totalBytes += pcm.Length;
+        foreach (var (_, pcm) in chunks) totalBytes += pcm.Len;
         using var fs = new FileStream(path, FileMode.Create);
         using var bw = new BinaryWriter(fs);
         bw.Write("RIFF"u8);
@@ -1829,7 +2326,7 @@ static class ClipEncoder
         bw.Write(fmt.BlockAlign); bw.Write(fmt.BitDepth);
         bw.Write("data"u8);
         bw.Write(totalBytes);
-        foreach (var (_, pcm) in chunks) bw.Write(pcm);
+        foreach (var (_, pcm) in chunks) bw.Write(pcm.Data, 0, pcm.Len);
     }
 }
 
@@ -1983,7 +2480,6 @@ public sealed class ClipEditorForm : Form
 
         Div(ref y);
 
-        // file info row with browse button
         y += 6;
         string fname = Path.GetFileName(_clip);
         _fileLabel = new Label { Text = fname.Length > 62 ? "…" + fname[^59..] : fname,
@@ -2201,17 +2697,13 @@ public class SidebarOverlay : Form
         expandedLeft  = monitorRect.Left;
         Location      = new Point(collapsedLeft, wa.Top);
 
-        // Build first so contentPanel ends up behind everything in z-order
         Build();
 
-        // ── left / right borders ──────────────────────────────────────
         Controls.Add(new Panel { Location = new Point(0, 0),                  Size = new Size(BORDER_W, Height), BackColor = SACCT });
         Controls.Add(new Panel { Location = new Point(PANEL_W - BORDER_W, 0), Size = new Size(BORDER_W, Height), BackColor = SACCT });
 
-        // ── bottom border ─────────────────────────────────────────────
         Controls.Add(new Panel { Location = new Point(0, Height - BORDER_W), Size = new Size(PANEL_W, BORDER_W), BackColor = SACCT });
 
-        // ── Quit footer pinned at BOTTOM ─────────────────────────────
         var qFooter = new Panel {
             Location  = new Point(BORDER_W, Height - QUIT_H - BORDER_W),
             Size      = new Size(PANEL_W - BORDER_W * 2, QUIT_H),
@@ -2222,7 +2714,7 @@ public class SidebarOverlay : Form
             Font = DP.F(14f, FontStyle.Bold),
         });
         Controls.Add(qFooter);
-        qFooter.BringToFront();  // Controls[0] — nothing added after this
+        qFooter.BringToFront();
 
         int extra = wa.Height - (layoutY + 36) - QUIT_H - BORDER_W * 2;
         if (extra > 0)
@@ -2269,15 +2761,12 @@ public class SidebarOverlay : Form
 
         layoutY = 0;
 
-        // ── accent bar ────────────────────────────────────────────────
         contentPanel.Controls.Add(new Panel {
             Location = Point.Empty, Size = new Size(PANEL_W - BORDER_W * 2, 2), BackColor = SACCT,
         });
         layoutY += 2;
 
-        // ── title bar ─────────────────────────────────────────────────
         var tbar = new Panel { Location = new Point(0, layoutY), Size = new Size(PANEL_W - BORDER_W * 2, 44), BackColor = STBAR };
-        // accent left stripe
         tbar.Controls.Add(new Panel { Location = Point.Empty, Size = new Size(3, 44), BackColor = SACCT });
         tbar.Controls.Add(new Label {
             Text = "ATLAS", ForeColor = SFG, Font = DP.F(9f),
@@ -2293,7 +2782,6 @@ public class SidebarOverlay : Form
 
         AddSep();
 
-        // ── Clip button ── prominent at top ───────────────────────────
         layoutY += 10;
         clipBtnY = layoutY;
         clipBtn = new RoundButton("CLIP", () => owner.TriggerClip(), PANEL_W - PAD * 2, 25, green: true) {
@@ -2554,6 +3042,9 @@ public class MainForm : Form
     static readonly Font  F8      = DP.F(8f);
     static readonly Font  F7      = DP.F(7f);
 
+    static readonly System.Text.RegularExpressions.Regex _ffVerRx =
+        new(@"version (\d+)", System.Text.RegularExpressions.RegexOptions.Compiled);
+
     const int WM_HOTKEY = 0x0312, WM_NCHITTEST = 0x0084;
     const int HTCAPTION = 2, HTCLIENT = 1;
     const int HK = 1, HK2 = 2, HK3 = 3, HK4 = 4;
@@ -2568,9 +3059,9 @@ public class MainForm : Form
     static extern int mciSendString(string cmd, char[]? ret, int cch, IntPtr hwnd);
 
     SidebarOverlay?  sidebar;
-    readonly RingBuffer<byte[]> vidBuf    = new(b => b.LongLength);
-    readonly RingBuffer<byte[]> audBuf    = new(b => b.LongLength);
-    readonly RingBuffer<byte[]> micAudBuf = new(b => b.LongLength);
+    readonly RingBuffer<byte[]>                 vidBuf    = new(b => b.LongLength);
+    readonly RingBuffer<(byte[] Data, int Len)> audBuf    = new(p => p.Len, onEvict: p => ArrayPool<byte>.Shared.Return(p.Data));
+    readonly RingBuffer<(byte[] Data, int Len)> micAudBuf = new(p => p.Len, onEvict: p => ArrayPool<byte>.Shared.Return(p.Data));
     WavFormat?       captureFormat, micCaptureFormat;
     LoopbackRecorder? audioRec, micAudioRec;
     CancellationTokenSource? recCts;
@@ -2580,6 +3071,7 @@ public class MainForm : Form
     bool             saving, hotkeyOk;
     bool             _micMuted;
     volatile float   _audioLevel;
+    int              _lastElapsedSec = -1;
     ScreenGrabber?   _grabber;
     NotifyIcon?      trayIcon;
     Icon?            _trayIconHandle;
@@ -2922,9 +3414,7 @@ public class MainForm : Form
     void PopulateAllDropdowns()
     {
         monPicker.ClearItems();
-        var monLabels = new string[monitors.Count];
-        for (int i = 0; i < monitors.Count; i++) monLabels[i] = monitors[i].ToString();
-        monPicker.SetItems(monLabels);
+        monPicker.SetItems(monitors.Select(m => m.ToString()).ToArray());
         if (monitors.Count > 0)
             monPicker.SelectedIndex = Math.Min(cfg.MonitorIdx, monitors.Count - 1);
 
@@ -2934,13 +3424,19 @@ public class MainForm : Form
         audPicker.ClearItems();
         var defDev   = LoopbackRecorder.DefaultOutputDeviceName();
         string defLabel = defDev != null ? $"Default — {defDev}" : "Default";
-        audPicker.SetItems(new[] { defLabel }.Concat(audioDevs).ToArray());
+        var audItems = new string[audioDevs.Count + 1];
+        audItems[0] = defLabel;
+        audioDevs.CopyTo(audItems, 1);
+        audPicker.SetItems(audItems);
         audPicker.SelectedIndex = cfg.AudioDevice == null
             ? 0
             : Math.Max(0, audioDevs.IndexOf(cfg.AudioDevice) + 1);
 
         micPicker.ClearItems();
-        micPicker.SetItems(new[] { "None" }.Concat(micDevs).ToArray());
+        var micItems = new string[micDevs.Count + 1];
+        micItems[0] = "None";
+        micDevs.CopyTo(micItems, 1);
+        micPicker.SetItems(micItems);
         micPicker.SelectedIndex = cfg.MicDevice == null
             ? 0
             : Math.Max(0, micDevs.IndexOf(cfg.MicDevice) + 1);
@@ -2995,7 +3491,6 @@ public class MainForm : Form
 
     void StartCapture()
     {
-        // Output directory validation
         string outDir = cfg.OutDir;
         try { Directory.CreateDirectory(outDir); }
         catch (Exception ex) {
@@ -3010,7 +3505,6 @@ public class MainForm : Form
             sidebar?.UpdateStatus("", statusLabel.Text, 0, 1);
             return;
         }
-        // Disk space check
         try {
             var drive = new DriveInfo(Path.GetPathRoot(outDir) ?? "C:\\");
             if (drive.AvailableFreeSpace < 512L * 1024 * 1024)
@@ -3041,10 +3535,10 @@ public class MainForm : Form
         audioRec?.Dispose();
         audioRec = new LoopbackRecorder(devName, (data, n) => {
             if (tok.IsCancellationRequested) return;
-            audBuf.Add(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 0.001, data);
-            if (data.Length >= 4) {
+            audBuf.Add(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 0.001, (data, n));
+            if (n >= 4) {
                 float sum = 0;
-                int count = Math.Min(data.Length / 4, 512);
+                int count = Math.Min(n / 4, 512);
                 for (int i = 0; i < count; i++) {
                     float s = BitConverter.ToSingle(data, i * 4);
                     sum += s * s;
@@ -3066,7 +3560,7 @@ public class MainForm : Form
         {
             micAudioRec = new LoopbackRecorder(micDev, (data, n) => {
                 if (tok.IsCancellationRequested) return;
-                micAudBuf.Add(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 0.001, data);
+                micAudBuf.Add(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 0.001, (data, n));
             }, captureMode: true);
             micAudioRec.Start();
             micCaptureFormat = micAudioRec.CaptureFormat;
@@ -3075,7 +3569,8 @@ public class MainForm : Form
             micAudioRec = null;
 
         _grabber = new ScreenGrabber(monitor.Rect, outSz, fps,
-            (jpg, ts) => vidBuf.Add(ts, jpg), tok, cfg.ShowCursor);
+            (jpg, ts) => vidBuf.Add(ts, jpg), tok, cfg.ShowCursor,
+            ffmpegExe, videoEncoder);
         Task.Run(() => {
             try { _grabber.Run(); }
             catch (Exception ex) when (!tok.IsCancellationRequested)
@@ -3227,7 +3722,11 @@ public class MainForm : Form
         int cap = DurationMap.TryGetValue(cfg.ClipLen, out int d) ? d : 30;
         double elapsed = Math.Min(_recWatch.Elapsed.TotalSeconds, cap);
         progressBar.SetProgress(elapsed, cap);
-        timeLabel.Text = $"{(int)elapsed}s / {cap}s";
+        int elapsedSec = (int)elapsed;
+        if (elapsedSec != _lastElapsedSec) {
+            _lastElapsedSec = elapsedSec;
+            timeLabel.Text = $"{elapsedSec}s / {cap}s";
+        }
 
         if (elapsed < 2 && statusLabel.Text.StartsWith("Buffering"))
             statusLabel.Text = "Warming up…";
@@ -3377,7 +3876,7 @@ public class MainForm : Form
             micAudBuf.Clear();
             micAudioRec = new LoopbackRecorder(cfg.MicDevice, (data, n) => {
                 if (tok.IsCancellationRequested) return;
-                micAudBuf.Add(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 0.001, data);
+                micAudBuf.Add(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 0.001, (data, n));
             }, captureMode: true);
             micAudioRec.Start();
             micCaptureFormat = micAudioRec.CaptureFormat;
@@ -3419,7 +3918,7 @@ public class MainForm : Form
             using var p = Process.Start(psi)!;
             string line = p.StandardOutput.ReadLine() ?? "";
             p.WaitForExit(3000);
-            var m = System.Text.RegularExpressions.Regex.Match(line, @"version (\d+)");
+            var m = _ffVerRx.Match(line);
             if (m.Success && int.TryParse(m.Groups[1].Value, out int major) && major < 4)
                 statusLabel.Text = $"⚠ ffmpeg {major}.x detected — recommend v4+";
         } catch { }
